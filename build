@@ -1,0 +1,232 @@
+#!groovy
+library 'reference-pipeline'
+library 'fxg-reference-pipeline'
+library 'AppServiceAccount'
+
+pipeline {
+    agent { label 'colo' }
+
+    tools {
+        jdk 'JAVA_8'
+        maven 'Maven 3.3.3'
+    }
+
+    stages {
+        stage('Print Node') {
+            steps {
+                script {
+                    echo "NODE_NAME = ${env.NODE_NAME}"
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                script {
+                    APP_NAME = "fxg-cs-cust-trans-replay"
+                    NEXUS_IQ_APP_NAME = "fxg-cs-cust-trans-replay-3538120"
+                    EAI_NUMBER = 3538120
+                    GIT_BRANCH = "${env.BRANCH_NAME}"
+                    SONARCUBE_EXCLUSIONS = '**/src/test/**,**/src/main/java/com/fedex/xmlns/**,**/src/main/java/com/fedex/smartpost/customermaintenance/model/**,**/src/main/java/com/fedex/smartpost/customermaintenance/dto/**,**/src/main/java/com/fedex/smartpost/customermaintenance/dao/**,**/src/main/java/com/fedex/smartpost/customermaintenance/entity/**'
+                    VERSION = getApplicationProperty property: 'version'
+                    GROUP = getApplicationProperty property: 'group'
+					 APP_VERSION = ""
+					  APP_CM_EMP_IDS = ""
+                      NEXUS_CREDS_ID = ''
+                     APP_GROUP = ""
+                     JAR_PATH = ""
+                     NEXUS_REPO = ""
+                     RELEASE_FLAG = false
+                     APPD_PLAN = "fedex1-test"
+                     REPLICAS = 1
+
+                  
+                }
+            }
+        }
+        
+
+        stage('Initialize') {
+            steps {
+                script {
+                
+                   // properties([pipelineTriggers([pollSCM('* * * * *')])])
+                   
+                    APP_GROUP = getApplicationProperty property: 'group'
+
+                    APP_VERSION = getApplicationProperty property: 'version'
+
+                    println "App version is ${APP_VERSION}"
+                    println "Group is ${APP_GROUP}"
+
+                    if (GIT_BRANCH.contains('release')) {
+                        NEXUS_REPO = "release"
+                        NEXUS_VERSION = "${APP_VERSION}.release"
+                        RELEASE_FLAG = true
+                    } else {
+                        NEXUS_REPO = "snapshot"
+                        NEXUS_VERSION = "${APP_VERSION}-SNAPSHOT"
+                    }
+
+                    println "Nexus Repo is ${NEXUS_REPO}"
+                }
+                
+                //define scm connection for polling
+                
+               // git branch: "${GIT_BRANCH}", credentialsId: "${EAI_NUMBER}-gitlab-jenkins-key", url: "git@gitlab.prod.fedex.com:APP${EAI_NUMBER}/${APP_NAME}.git"
+           
+            }
+        }
+		
+        stage('GitLab Checkout') {
+            steps {
+                script {
+                    checkout([
+                            $class                           : 'GitSCM',
+                            branches                         : [[name: "remotes/origin/${GIT_BRANCH}"]],
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions                       : [
+                                    [$class: 'WipeWorkspace']
+                            ],
+                            submoduleCfg                     : [],
+                            userRemoteConfigs                : [
+                                    [
+                                            credentialsId: "${EAI_NUMBER}-gitlab-jenkins-key",
+                                            url          : "git@gitlab.prod.fedex.com:APP${EAI_NUMBER}/${APP_NAME}.git"
+                                    ]
+                            ]
+                    ])
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    sh "chmod +x gradlew"
+                     sh "./gradlew clean build test bootJar"
+                    // sh "./gradlew clean build -x test bootJar"
+                }
+            }
+    //  post {
+    //        always {
+    //           junit '**/test-results/test/*.xml'
+
+    //     }
+    //   success {
+    //      echo 'Build complete'
+    //        }
+    //  }
+       }
+
+        stage('Code Analysis') {
+            steps {
+                parallel(
+                        'CodeQuality': {
+                            codeQuality junitPath: '**/test-results/test/*.xml',
+                                    pmdPath: '**/pmd/*.xml'
+                        },
+                        'Jacoco': {
+                            step([$class: 'JacocoPublisher'])
+                        }
+                )
+            }
+        } 
+
+        stage('SonarQube') {
+            steps {
+                println "Running SonarQube"
+                sonarqube projectName: "${APP_NAME}",
+                        projectKey: "${APP_NAME}",
+                        projectVersion: "${VERSION}",
+                        src: 'src/main',
+                        test: 'src/test/java',
+                        binaries: "build/classes",
+                        repo: 'git',
+                        scmDisabled: 'false',
+                        exclusions: "${SONARCUBE_EXCLUSIONS}",
+                        jacocoPath: 'build/jacoco/test.exec'
+            }
+        }
+
+     //  stage("Quality Gate") {
+     //       steps {
+     //           sonarQualityGate()
+     //       }
+     //   }
+
+        stage('SonarQube Permissions') {
+           steps {
+               sonarQubePermissions projectkey: "${APP_NAME}", eai: "${EAI_NUMBER}"
+           }
+        }
+
+        stage('Nexus Evaluator Stage') {
+            steps {
+               nexusPolicyEvaluation iqApplication: "${NEXUS_IQ_APP_NAME}", iqStage: 'build'
+            }
+       }
+
+        // The source needs to be stashed before the analysis
+        stage("Stashing Source for Fortify Scan ") {
+            steps {
+                stash includes: '**', name: 'source'
+            }
+        }
+
+       // stage("Get Fortify Scripts") {
+            // Fortify scripts are located on the Jenkins controller
+        //    agent { label 'master' }
+
+        //    steps {
+        //        getFortifyScripts()
+        //    }
+       //    }
+
+       // stage("Run Fortify Analysis") {
+        //    steps {
+         //       unstash 'source'
+         //       unstash 'stash-master'
+         //       unstash 'stash-master1'
+         //       println "running Fortify Analysis"
+         //       sh "\"${WORKSPACE}/translate.sh\" ${EAI_NUMBER}_${APP_NAME} RUN"
+          //  }
+    //    }
+
+        // TODO: Extra validation: pull jar from repo for release, if exists error out
+        // TODO: Extra validation: if nexus_Repo is release , check version to see it doesn't have snapshot and error out, at some point later, we can add more validations
+        
+		stage('Nexus Staging') {
+            steps {
+                // unstash 'buildDir'
+                // unstash 'builtArtifact'
+                sh "ls -ltr build/libs"
+                println "Uploading jar to Nexus ${APP_NAME}"
+                sh "echo build/libs/${APP_NAME}-${NEXUS_VERSION}.jar uploading to repo ${NEXUS_REPO} group eai${EAI_NUMBER}.${APP_GROUP} nexus version ${NEXUS_VERSION}"
+                nexusArtifactUploader artifacts: [[artifactId: "${APP_NAME}", classifier: '', file: "build/libs/${APP_NAME}-${APP_VERSION}.jar", type: 'jar']],
+                        credentialsId: "${EAI_NUMBER}_nexus",
+                        groupId: "eai${EAI_NUMBER}.${APP_GROUP}",
+                        nexusUrl: 'nexus.prod.cloud.fedex.com:8443/nexus',
+                        nexusVersion: 'nexus3',
+                        protocol: 'https',
+                        repository: "${NEXUS_REPO}",
+                        version: "${NEXUS_VERSION}"
+
+              }
+        }
+        
+        // stage('Auto Deploy') {
+         //  when {
+         //       anyOf {
+         //            branch 'development'
+         //          branch 'release'
+         //        }
+         //  }
+         // steps {
+         //      build job: "../DEPLOY_${APP_NAME}/${GIT_BRANCH}",
+         //       parameters: [string(name: 'SPACE_PARAM', value: String.valueOf("${GIT_BRANCH}"))]
+         //    }
+         //  } 
+    }
+    
+}
