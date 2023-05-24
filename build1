@@ -1,0 +1,233 @@
+library 'reference-pipeline'
+library 'AppServiceAccount'
+
+pipeline {
+
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    tools {
+        jdk 'JAVA_8'
+        nodejs 'NodeJS-10.14.1'
+    }
+
+    environment {
+        CF_APP_NAME = "fxg-cs-cust-trans-replay-ui"
+        EAI_NUMBER = "3535077"
+        EAI_NAME = ""
+        /* EAI Folder is needed for Nexus IQ. You can go to keyword 'cicd', login and enter your EAI and then select nexusIQ to onboard. You will get an email with EAI Folder name. */
+        EAI_FOLDER_NAME = "FXGFESendShipCreateShip-3535077"
+        /* Employee numbers who can approve the deployment into production */
+        APP_CM_EMP_IDS = ""
+        NEXUS_CREDS_ID = ''
+        /* Get the channel URL from Microsoft Teams that you have created for your team*/
+        //TEAMS_WEBHOOK = "https://myfedex.webhook.office.com/webhookb2/0dd046b4-1392-479e-8140-fe0980d594cf@b945c813-dce6-41f8-8457-5a12c2fe15bf/IncomingWebhook/4e84f55639824821ac07e5924f1e70b2/3b3cbeaa-5c51-4607-8ece-02a1552d830f"
+        /* Leave the following default values */
+        APP_VERSION = ""
+        //GIT_BRANCH = "${env.BRANCH_NAME}"
+        GIT_BRANCH = "okta-feature"
+        APP_GROUP = ""
+        JAR_PATH = ""
+        NEXUS_REPO = ""
+        RELEASE_FLAG = false
+        APPD_PLAN = "fedex1-test"
+        REPLICAS = 1
+
+    }
+
+
+    stages {
+
+        stage('Initialize') {
+            steps {
+                script {
+
+                    APP_GROUP = getApplicationProperty property: 'group'
+
+                    APP_VERSION = getApplicationProperty property: 'version'
+
+                    println "App version is ${APP_VERSION}"
+                    println "Group is ${APP_GROUP}"
+
+                    if (GIT_BRANCH.contains('release')) {
+                        NEXUS_REPO = "release"
+                        NEXUS_VERSION = "${APP_VERSION}.release"
+                        RELEASE_FLAG = true
+                    } else {
+                        NEXUS_REPO = "snapshot"
+                        NEXUS_VERSION = "${APP_VERSION}-SNAPSHOT"
+                    }
+
+                    println "Nexus Repo is ${NEXUS_REPO}"
+                }
+            }
+        }
+        stage('GitLab Checkout') {
+            steps {
+                script {
+                    checkout([
+                            $class                           : 'GitSCM',
+                            branches                         : [[name: "remotes/origin/${GIT_BRANCH}"]],
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions                       : [
+                                    [$class: 'WipeWorkspace']
+                            ],
+                            submoduleCfg                     : [],
+                            userRemoteConfigs                : [
+                                    [
+                                            credentialsId: "${EAI_NUMBER}-gitlab-jenkins-key",
+                                            url          : "git@gitlab.prod.fedex.com:APP3535077/fxg-cs-cust-trans-replay-ui.git"
+                                    ]
+                            ]
+                    ])
+                }
+            }
+        }
+
+        stage('Build') {
+            agent {
+                docker {
+                    label 'docker'
+                    image 'nexus2.prod.cloud.fedex.com:8444/fdx/jenkins/default-tools-image'
+                }
+            }
+            steps {
+                script {
+                    sh 'npm cache --force clean'
+                    sh 'npm config set registry	https://nexus.prod.cloud.fedex.com:8443/nexus/content/groups/registry-npm-fedex/'
+                    sh 'chmod +x gradlew'
+                    GIT_COMMIT_HASH = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    echo 'after git rev-parse'
+                    echo "print version on line.."
+                    echo "$APP_VERSION"
+                    echo "$CF_APP_NAME-$APP_VERSION"
+
+                    // TODO: doesn't have a bootjar
+                    sh """#!/bin/bash
+					./gradlew -P revision=$GIT_COMMIT_HASH clean build """
+                    sh 'ls -ltr build/libs'
+                }
+
+            }
+            post {
+
+
+                success {
+
+                    echo 'Build complete'
+                    stash includes: '**/', name: 'buildDir'
+                    stash includes: "**/libs/${CF_APP_NAME}-${APP_VERSION}" + ".jar", name: "builtArtifact"
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            agent {
+                docker {
+                    label 'docker'
+                    image 'nexus2.prod.cloud.fedex.com:8444/fdx/jenkins/headless-chrome-image'
+                }
+            }
+            steps {
+                sh """
+					wget https://nexus.prod.cloud.fedex.com:8443/nexus/repository/devframeworkrepo/com/fedex/devopsys/external/njswrapper/external-njswrapper-1/01/01-eirslett-lib/external-njswrapper-1.01.01-eirslett-lib-1.6/1.6/external-njswrapper-1.01.01-eirslett-lib-1.6-1.6.tar
+					tar xf external-njswrapper-1.01.01-eirslett-lib-1.6-1.6.tar
+
+					cd src/main/webapp
+
+                    # Needed for unit testing
+                    sed  -i  '1i const puppeteer = require("puppeteer");' ${WORKSPACE}/src/main/webapp/karma.conf.js
+                    sed  -i  '2i process.env.CHROME_BIN = puppeteer.executablePath();' ${WORKSPACE}/src/main/webapp/karma.conf.js
+                    sed  -i  '3i const browser = puppeteer.launch({args: ["--no-sandbox"]});' ${WORKSPACE}/src/main/webapp/karma.conf.js
+
+					npm install
+					npm install karma-junit-reporter --save-dev
+					npm install puppeteer
+					npm test
+
+					chmod 755 -R node_modules
+						export CHROME_BIN=${WORKSPACE}/node_modules/puppeteer/.local-chromium/linux-499413/chrome-linux/chrome
+						export LD_LIBRARY_PATH=${WORKSPACE}/lib/chrome/linux-x64
+
+
+
+					"""
+            }
+            post {
+                success {
+                    echo 'Unit Tests Success'
+                    stash includes: '**/coverage/*', name: 'testCoverage'
+                }
+            }
+        }
+
+        
+            
+          
+            
+               /*  stage('SonarQube & NexusIQ') {
+                 parallel {
+                 stage('SonarQube') {
+                    steps {
+                        sonarqube projectName: "${CF_APP_NAME}",
+                                projectKey: "${APP_GROUP}",
+                                projectVersion: "${APP_VERSION}",
+                                src: 'src/main',
+                                test: 'src/test/java',
+                                binaries: "build/classes",                
+                                repo: 'git',
+                                jacocoPath: 'build/jacoco/jacocoTest.exec'
+
+                    }
+                }
+                stage('NexusIQ') {
+                    steps {
+                        nexusPolicyEvaluation iqApplication: "${EAI_FOLDER_NAME}", iqStage: 'build'
+                    }
+                }
+
+            }
+        } */    
+
+        stage('Nexus Staging') {
+            steps {
+                unstash 'buildDir'
+                unstash 'builtArtifact'
+                sh "ls -ltr build/libs"
+                println "Uploading jar to Nexus ${CF_APP_NAME}"
+                sh "echo build/libs/${CF_APP_NAME}-${NEXUS_VERSION}.jar uploading to repo ${NEXUS_REPO} group eai${EAI_NUMBER}.${APP_GROUP} nexus version ${NEXUS_VERSION}"
+                nexusArtifactUploader artifacts: [[artifactId: "${CF_APP_NAME}", classifier: '', file: "build/libs/${CF_APP_NAME}-${APP_VERSION}.jar", type: 'jar']],
+                        credentialsId: "${EAI_NUMBER}_NEXUS",
+                        groupId: "eai${EAI_NUMBER}.${APP_GROUP}",
+                        nexusUrl: 'nexus.prod.cloud.fedex.com:8443/nexus',
+                        nexusVersion: 'nexus3',
+                        protocol: 'https',
+                        repository: "${NEXUS_REPO}",
+                        version: "${NEXUS_VERSION}"
+
+              }
+        }
+        /*stage('Auto Deploy') {
+            when {
+                anyOf {
+                    branch 'development'
+                    branch 'release'
+                }
+            }
+            steps {
+                build job: "../DEPLOY_${CF_APP_NAME}/${GIT_BRANCH}",
+                        parameters: [string(name: 'SPACE_PARAM', value: String.valueOf("${GIT_BRANCH}"))]
+            }
+        }*/
+
+
+    }
+
+
+    
+
+
+}
