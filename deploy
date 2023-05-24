@@ -1,0 +1,261 @@
+#!groovy
+library 'reference-pipeline'
+library 'fxg-reference-pipeline'
+library 'AppServiceAccount'
+
+pipeline {
+
+    agent { label 'colo' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    tools {
+        jdk 'JAVA_8'
+        // nodejs 'NodeJS-10.14.1'
+    }
+
+    parameters {
+        // the default is always the first item in the list
+        choice(name: 'SPACE_PARAM', choices: ['development', 'release', 'staging', 'production'], description: 'Target Environment')
+
+        string( name: 'version', description: 'Which version?', defaultValue:'' )
+    }
+
+    stages {
+
+        stage('Print Node') {
+            steps {
+                script {
+                    echo "NODE_NAME = ${env.NODE_NAME}"
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                script {
+                    GIT_BRANCH = "${env.BRANCH_NAME}"
+                    APP_NAME = "fxg-cs-cust-trans-replay"
+                    EAI_NUMBER = 3538120
+                    PCF_SPACE = "development"
+                    // TEAMS_WEBHOOK = "https://outlook.office.com/webhook/0ebb113d-5c9c-45da-8c1d-c63213eff629@b945c813-dce6-41f8-8457-5a12c2fe15bf/IncomingWebhook/dbd48c2e60b941e69c600346b3f933ff/21546bd4-117f-45ca-9920-3c98fb93aca4"
+                    PCF_CONFIG_SERVER_NAME = "fxg-cs-configuration-service"
+                    withCredentials([string(credentialsId: "${EAI_NUMBER}_PCF_PAM_ID", variable: 'secretText')]) {
+                        PAM_ACCOUNT_ID = secretText
+                    }
+                    RELEASE_FLAG = false
+                    GROUP = getApplicationProperty property: 'group'
+                    systemTeamEmail = 'gsi-st@corp.ds.fedex.com'
+
+                    if (BRANCH_NAME != 'development' && BRANCH_NAME != 'release' && BRANCH_NAME != 'master') {
+                        error('Error: Deployment cannot occur from a non-protected branch.  Please deploy from development, release, or master branch.')
+                    }
+
+                    if (version == '')
+                    {
+                        version = getApplicationProperty property: 'version'
+                    }
+
+                    print("Target Environment Param: ")
+                    println("${params.SPACE_PARAM}")
+
+                    if (BRANCH_NAME == 'development') {
+                        NEXUS_REPO = "snapshot"
+                        NEXUS_VERSION = "${version}-SNAPSHOT"
+                    } else {
+                        NEXUS_REPO = "release"
+                        NEXUS_VERSION = "${version}.RELEASE"
+                        RELEASE_FLAG = true
+                        PCF_SPACE = "release"
+                        if ("${params.SPACE_PARAM}" == 'development') {
+                            error('Error: Deployment cannot occur to Development space with Release version.')
+                        } else if ("${params.SPACE_PARAM}" != '') {
+                            PCF_SPACE = "${params.SPACE_PARAM}"
+                        }
+                    }
+                    print("Target Environment: ")
+                    println(PCF_SPACE)
+                }
+            }
+        }
+
+        stage('Download Nexus Artifact') {
+            when {
+                anyOf {
+                    branch 'development'
+                    branch 'release'
+                    branch 'master'
+                }
+            }
+            steps {
+                println "Download ${version} version of ${APP_NAME} ; repo is ${NEXUS_REPO} ; group eai ${EAI_NUMBER}.${GROUP} ; nexus version is ${NEXUS_VERSION}"
+                downloadNexusArtifact groupId: "eai${EAI_NUMBER}.${GROUP}",
+                        artifactId: "${APP_NAME}",
+                        repo: "${NEXUS_REPO}",
+                        release: "${RELEASE_FLAG}".toBoolean(),
+                        extension: "jar",
+                        version: "${NEXUS_VERSION}"
+
+            }
+        }
+
+        stage('approval') {
+            agent none
+            when {
+                anyOf {
+                    environment name: 'SPACE_PARAM', value: 'production'
+                }
+            }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                script {
+                    input(
+                            message: "Do you want to deploy in the $SPACE_PARAM environment?",
+                            //list of employee numbers who can approve this request
+                            submitter: "$systemTeamEmail"
+                    )
+                    echo ("Confirmation Accepted")
+                }
+            }
+        }
+
+        stage("Deploy to PCF space") {
+            when {
+                anyOf {
+                    branch 'development'
+                    branch 'release'
+                    branch 'master'
+                }
+            }
+            steps {
+                script {
+                    for (foundation in getAllFoundations()){
+                        deployToPcf("${foundation}")
+                    }
+                }
+            }
+        }
+
+    }  
+
+}
+
+def getAllFoundations() {
+    switch ("${SPACE_PARAM}") {
+        case "development":
+        case "release":
+            return ["clwdev1", "clwdev2", "clwdev3"]
+        case "staging":
+        case "production":
+            return ["clwcc1", "clwcc2", "clwcc3"]
+        default:
+            return ["clwdev1", "clwdev2", "clwdev3"]
+    }
+}
+
+def getConfigSvrSpaceSuffix() {
+    switch ("${SPACE_PARAM}") {
+        case "development":
+            return "dev"
+        case "release":
+            return "dev"
+        case "staging":
+            return "stage"
+        case "production":
+            return "prod"
+        default:
+            return "dev"
+    }
+}
+
+def getGslbSpaceSuffix() {
+    switch ("${SPACE_PARAM}") {
+        case "development":
+            return "dev"
+        case "release":
+            return "rel"
+        case "staging":
+            return "stage"
+        case "production":
+            return "prod"
+        default:
+            return "dev"
+    }
+}
+
+def getAppDPlan() {
+    switch ("${SPACE_PARAM}") {
+        case "development":
+        case "release":
+            return "fedex1-test"
+        case "staging":
+        case "production":
+            return "fedex1"
+        default:
+            return "fedex1-test"
+    }
+}
+
+def getCloudConfigLevel() {
+    switch ("${SPACE_PARAM}") {
+        case "development":
+        case "release":
+            return "master"
+        case "staging":
+        case "production":
+            return "master"
+        default:
+            return "master"
+    }
+}
+
+def deployToPcf(foundation) {
+    CONFIG_SVR_SUFFIX = getConfigSvrSpaceSuffix()
+    GSLB_SUFFIX = getGslbSpaceSuffix()
+    CLOUD_CONFIG_LABEL = getCloudConfigLevel()
+    REPLICAS = 1
+    CF_API = "https://api.sys.${foundation}.paas.fedex.com"
+    CONFIG_SERVER_URL = "https://${PCF_CONFIG_SERVER_NAME}-${CONFIG_SVR_SUFFIX}.app.${foundation}.paas.fedex.com/"
+        ENV_PROPERTIES = [
+                      "CONFIG_URI"   : "${CONFIG_SERVER_URL}",
+                      "actuator.usr" : "admin", 
+                      "actuator.pwd" : "password" 
+                      ]
+
+
+    // EXT_CUPS_CMD = ["${PCF_CONFIG_SERVER_NAME}-svc":["apiUrl":"https://${PCF_CONFIG_SERVER_NAME}-${CONFIG_SVR_SUFFIX}.app.${foundation}.paas.fedex.com", "label": "${CLOUD_CONFIG_LABEL}"]]
+
+    pcfBlueGreenDeploy pamId: "${PAM_ACCOUNT_ID}",
+            url: "${CF_API}",
+            stage: "${SPACE_PARAM}",
+            appName: "${APP_NAME}",
+            timeout: 90,
+            instances: "${REPLICAS}",
+            jarPath: "${APP_NAME}-${NEXUS_VERSION}.jar",
+            foundation: "${foundation}",
+            appdPlan: getAppDPlan(),
+            eaiNum: "${EAI_NUMBER}",
+            level: "${GSLB_SUFFIX}",
+            eaiAppName: "${APP_NAME}",
+            // javaOpts: "-Dspring.profiles.active=${SPACE_PARAM}",
+            // extCupsCmd : EXT_CUPS_CMD,
+            gslbName: "${APP_NAME}-${GSLB_SUFFIX}",
+            props:ENV_PROPERTIES,
+            javaOpts: "-Dspring.profiles.active=${SPACE_PARAM} -Dhttp.proxyHost=internet.proxy.fedex.com -Dhttp.proxyPort=3128 -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 -Dhttp.proxySet=true -Dhttps.proxySet=true ",
+             
+            smoke: {
+                echo "Smoke test for ${APP_NAME}-${GSLB_SUFFIX}"
+                def URL = "https://${APP_NAME}-${GSLB_SUFFIX}-tmp.app.${foundation}.paas.fedex.com/actuator/health"
+                def VerifyText = "UP"
+                def SERVICE_STATUS = sh (script: "curl -f -s ${URL} > /dev/null", returnStatus: true)
+                echo "$SERVICE_STATUS"
+                if( SERVICE_STATUS != 0  )
+                    error "Unable to connect to service (${SERVICE_STATUS}): ${URL}"
+                def SERVICE_BODY = sh ( script: "curl -s ${URL}", returnStdout: true ).trim()
+                assert SERVICE_BODY.contains(VerifyText) : "JSON Does not contain '${VerifyText}' for ${URL}"
+            }
+}
